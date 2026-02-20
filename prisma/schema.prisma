@@ -1,0 +1,70 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String       @id @default(uuid())
+  telegramId      BigInt       @unique
+  username        String?
+  fullName        String
+  role            String       @default("STUDENT")
+  joinDate        DateTime     @default(now())
+  lastActivity    DateTime     @default(now())
+  totalHomeworks  Int          @default(0)
+  missedHomeworks Int          @default(0)
+  accuracy        Float        @default(0.0)
+  groupId         String?
+  group           Group?       @relation(fields: [groupId], references: [id])
+  submissions     Submission[]
+}
+
+model Group {
+  id          String     @id @default(uuid())
+  name        String     @unique
+  description String
+  createdAt   DateTime   @default(now())
+  users       User[]
+  homeworks   Homework[]
+}
+
+model Homework {
+  id          String       @id @default(uuid())
+  hwNumber    Int          @unique
+  description String
+  deadline    DateTime
+  createdAt   DateTime     @default(now())
+  isActive    Boolean      @default(true)
+  groupId     String?
+  group       Group?       @relation(fields: [groupId], references: [id])
+  submissions Submission[]
+}
+
+model Submission {
+  id          String   @id @default(uuid())
+  userId      String
+  hwId        String
+  text        String
+  score       Int?
+  feedback    String?
+  submittedAt DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id])
+  homework Homework @relation(fields: [hwId], references: [id])
+}
+
+model ChannelPost {
+  id             String   @id @default(uuid())
+  telegramMsgId  Int      @unique
+  content        String
+  type           String
+  viewsCount     Int      @default(0)
+  postedAt       DateTime @default(now())
+}

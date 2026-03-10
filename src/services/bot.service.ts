@@ -9,7 +9,13 @@ const isDev = process.env.NODE_ENV === 'development';
 let bot: TelegramBot;
 
 if (isDev) {
-    bot = new TelegramBot(token, { polling: true });
+    bot = new TelegramBot(token, {
+        polling: {
+            params: {
+                allowed_updates: ['message', 'callback_query'],
+            },
+        },
+    });
 } else {
     // Webhook will be set up via Express
     bot = new TelegramBot(token);

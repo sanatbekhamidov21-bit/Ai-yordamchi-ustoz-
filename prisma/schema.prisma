@@ -27,12 +27,14 @@ model User {
 }
 
 model Group {
-  id          String     @id @default(uuid())
-  name        String     @unique
-  description String
-  createdAt   DateTime   @default(now())
-  users       User[]
-  homeworks   Homework[]
+  id             String     @id @default(uuid())
+  telegramId     String?    @unique
+  name           String     @unique
+  description    String
+  googleSheetId  String?    // Individual Google Sheet ID for this group
+  createdAt      DateTime   @default(now())
+  users          User[]
+  homeworks      Homework[]
 }
 
 model Homework {

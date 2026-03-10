@@ -7,7 +7,7 @@ Har doim sodda ingliz tili va qisqa misollar ishlat.`;
 
 export class SmmAgent extends GeminiAgent {
     constructor() {
-        super('gemini-1.5-flash', SMM_PROMPT);
+        super('google/gemini-2.0-flash-001', SMM_PROMPT);
     }
 
     async generateDailyPost(lastPosts: string[], engagementData: any): Promise<string> {

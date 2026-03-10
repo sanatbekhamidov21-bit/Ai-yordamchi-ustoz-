@@ -3,6 +3,8 @@ import prisma from '../database/prisma';
 import redis from '../services/redis.service';
 import bot from '../services/bot.service';
 import { smmAgent } from '../agents/smm.agent';
+import { sheetsService } from './sheets.service';
+import { CoinsController } from '../controllers/coins.controller';
 
 export class SchedulerService {
     static init() {
@@ -15,6 +17,12 @@ export class SchedulerService {
         // 2. Deadline Check every 1 minute
         cron.schedule('* * * * *', async () => {
             await SchedulerService.checkDeadlines();
+        });
+
+        // 3. Daily Inactivity Check at 21:00
+        cron.schedule('0 21 * * *', async () => {
+            console.log('Checking inactive students...');
+            await SchedulerService.checkInactiveStudents();
         });
     }
 
@@ -90,5 +98,35 @@ export class SchedulerService {
         // Assume group ID is stored or we use a fixed one for now
         const groupId = process.env.GROUP_ID;
         if (groupId) await bot.sendMessage(groupId, report, { parse_mode: 'Markdown' });
+    }
+
+    /**
+     * Check for students who have been inactive for 2+ days
+     * Sends warning messages to the group
+     */
+    private static async checkInactiveStudents() {
+        try {
+            const groups = await prisma.group.findMany({
+                where: {
+                    googleSheetId: { not: null },
+                    telegramId: { not: null }
+                }
+            });
+
+            for (const group of groups) {
+                const sheetId = group.googleSheetId!;
+                const telegramId = group.telegramId!;
+
+                console.log(`Checking inactivity for group: ${group.name} (${telegramId})`);
+                const inactiveStudents = await sheetsService.getInactiveStudents(sheetId, 2);
+
+                for (const name of inactiveStudents) {
+                    await CoinsController.sendInactivityWarning(telegramId, sheetId, name);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+        } catch (error) {
+            console.error('Error checking inactive students:', error);
+        }
     }
 }

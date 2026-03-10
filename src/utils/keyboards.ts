@@ -19,7 +19,14 @@ export const teacherKeyboard: ReplyKeyboardMarkup = {
 
 export const studentKeyboard: ReplyKeyboardMarkup = {
     keyboard: [
-        [{ text: "📥 Vazifa yuborish" }, { text: "👤 Profil" }],
+        [{ text: "📅 Davomat" }, { text: "✍️ Vazifa topshirish" }],
+        [{ text: "👤 Profil" }, { text: "🏠 Asosiy menyu" }]
+    ],
+    resize_keyboard: true
+};
+
+export const attendanceKeyboard: ReplyKeyboardMarkup = {
+    keyboard: [
         [{ text: "🏠 Asosiy menyu" }]
     ],
     resize_keyboard: true

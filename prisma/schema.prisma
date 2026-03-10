@@ -6,7 +6,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -19,11 +19,13 @@ model User {
   joinDate        DateTime     @default(now())
   lastActivity    DateTime     @default(now())
   totalHomeworks  Int          @default(0)
+  totalCoins      Int          @default(0)
   missedHomeworks Int          @default(0)
   accuracy        Float        @default(0.0)
   groupId         String?
   group           Group?       @relation(fields: [groupId], references: [id])
   submissions     Submission[]
+  messages        MessageLog[]
 }
 
 model Group {
@@ -69,4 +71,24 @@ model ChannelPost {
   type           String
   viewsCount     Int      @default(0)
   postedAt       DateTime @default(now())
+}
+
+model MessageLog {
+  id         String   @id @default(uuid())
+  userId     String
+  chatId     String
+  text       String?
+  mediaType  String?  // photo, voice, document, none
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model ScheduledTask {
+  id          String   @id @default(uuid())
+  type        String   // POST_MESSAGE, DAILY_STATS, etc.
+  payload     String   // JSON string with task data (chatId, text, etc.)
+  executeAt   DateTime
+  isCompleted Boolean  @default(false)
+  createdAt   DateTime @default(now())
 }

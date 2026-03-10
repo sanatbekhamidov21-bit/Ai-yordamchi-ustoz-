@@ -12,13 +12,19 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(helmet());
+app.use(helmet({
+    contentSecurityPolicy: false,
+}));
 app.use(cors());
 app.use(express.json());
 
 // 1. Webhook endpoint
-app.post(`/bot${process.env.BOT_TOKEN}`, webhookAuth, (req: express.Request, res: express.Response) => {
-    bot.processUpdate(req.body);
+app.post(`/bot${process.env.BOT_TOKEN}`, webhookAuth, async (req: express.Request, res: express.Response) => {
+    try {
+        await bot.processUpdate(req.body);
+    } catch (err) {
+        console.error('Bot process update error:', err);
+    }
     res.sendStatus(200);
 });
 
@@ -26,23 +32,38 @@ app.post(`/bot${process.env.BOT_TOKEN}`, webhookAuth, (req: express.Request, res
 app.get('/health', (req: express.Request, res: express.Response) => res.send('OK'));
 
 // 3. Initialize Polling or Webhook
+let isBotSetup = false;
 const setupBot = async () => {
+    if (isBotSetup) return;
+
+    bot.on('message', BotController.handleMessage);
+
     if (process.env.NODE_ENV === 'development') {
         console.log('Bot starting in Polling mode...');
-        bot.on('message', BotController.handleMessage);
     } else {
-        console.log('Bot starting in Webhook mode...');
         const url = `${process.env.BASE_WEBHOOK_URL}/bot${process.env.BOT_TOKEN}`;
+        console.log(`Setting webhook to: ${url}`);
         await bot.setWebHook(url, {
             secret_token: process.env.SECRET_TOKEN
         });
-        bot.on('message', BotController.handleMessage);
     }
+
+    SchedulerService.init();
+    isBotSetup = true;
+};
+
+// For Vercel Serverless
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(port, async () => {
+        console.log(`Server running on port ${port}`);
+        await setupBot();
+    });
+} else {
+    // In production (Vercel), we setup on the first request if not already done
+    app.use(async (req, res, next) => {
+        await setupBot();
+        next();
+    });
 }
 
-app.listen(port, async () => {
-    console.log(`Server running on port ${port}`);
-
-    await setupBot();
-    SchedulerService.init();
-});
+export default app;

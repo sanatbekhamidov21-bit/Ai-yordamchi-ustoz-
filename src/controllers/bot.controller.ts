@@ -20,8 +20,11 @@ export class BotController {
 
         // 0. Handle Multimodal Input (Photos, Voice, etc.)
         if (msg.photo || msg.voice || msg.document) {
+            await BotController.logMessage(msg);
             return BotController.handleMultimodalSubmission(msg);
         }
+
+        await BotController.logMessage(msg);
 
         // 0. Hashtag-based coin/attendance commands (group messages)
         if (text.startsWith('#')) {
@@ -168,6 +171,21 @@ export class BotController {
             return bot.sendMessage(chatId, "📥 Yaxshi, vazifangiz matnini yoki rasmini/audiosini shu yerga tashlang. AI tahlil qilib, coin hisoblaydi!", { reply_markup: studentKeyboard });
         }
 
+        if (text === "👤 Profil") {
+            const user = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
+            if (!user) return;
+
+            let profile = `👤 **Foydalanuvchi Profili:**\n\n`;
+            profile += `🆔 ID: \`${user.telegramId}\`\n`;
+            profile += `👤 Ism: ${user.fullName}\n`;
+            profile += `🎭 Rol: ${user.role}\n`;
+            profile += `💰 Jami Coinlar: ${user.totalCoins}\n`;
+            profile += `📚 Topshirilgan vazifalar: ${user.totalHomeworks} ta\n`;
+            profile += `📅 Ro'yxatdan o'tgan sana: ${user.joinDate.toLocaleDateString()}`;
+
+            return bot.sendMessage(chatId, profile, { parse_mode: 'Markdown' });
+        }
+
         if (text === "/ai feedback" || text.toLowerCase() === "feedback") {
             const lastSubHw = await redis.get(`last_hw:${userId}`);
             if (lastSubHw) {
@@ -216,43 +234,7 @@ export class BotController {
     }
 
 
-    private static async ensureGroup(msg: TelegramBot.Message) {
-        if (msg.chat.type === 'private') return;
-        const chatId = msg.chat.id.toString();
 
-        const existing = await prisma.group.findFirst({ where: { telegramId: chatId } });
-        if (existing) {
-            await prisma.group.update({
-                where: { id: existing.id },
-                data: { name: msg.chat.title || 'Guruh' }
-            });
-        } else {
-            await prisma.group.create({
-                data: {
-                    telegramId: chatId,
-                    name: msg.chat.title || 'Guruh',
-                    description: 'Guruh',
-                    googleSheetId: process.env.GOOGLE_SHEETS_ID
-                }
-            });
-        }
-    }
-
-    private static async ensureUser(msg: TelegramBot.Message) {
-        const user = msg.from;
-        if (!user) return;
-
-        await prisma.user.upsert({
-            where: { telegramId: BigInt(user.id) },
-            update: { lastActivity: new Date(), username: user.username },
-            create: {
-                telegramId: BigInt(user.id),
-                username: user.username,
-                fullName: `${user.first_name} ${user.last_name || ''}`.trim(),
-                role: 'STUDENT',
-            },
-        });
-    }
 
     private static async handlePassword(msg: TelegramBot.Message) {
         const userId = msg.from!.id;
@@ -606,7 +588,14 @@ export class BotController {
                         : (dbUser.fullName || dbUser.username || 'Student');
 
                     await sheetsService.markTask(sheetId, studentName!, evaluation.score >= 8 ? "to'liq" : "yarim");
-                    coinMessage = `\n\n💰 Sizga 5 ta coin berildi!`;
+
+                    // Increment in DB
+                    await prisma.user.update({
+                        where: { id: dbUser.id },
+                        data: { totalCoins: { increment: 5 } }
+                    });
+
+                    coinMessage = `\n\n💰 Sizga 5 ta coin berildi! Jami coinlaringiz: ${(dbUser.totalCoins || 0) + 5}`;
                 }
             }
 
@@ -651,5 +640,63 @@ export class BotController {
             where: { telegramId: chatId.toString() }
         });
         return group?.googleSheetId || process.env.GOOGLE_SHEETS_ID || null;
+    }
+
+    private static async logMessage(msg: TelegramBot.Message) {
+        const userId = msg.from?.id;
+        const chatId = msg.chat.id.toString();
+        if (!userId) return;
+
+        const dbUser = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
+        if (!dbUser) return;
+
+        let mediaType = 'none';
+        if (msg.photo) mediaType = 'photo';
+        else if (msg.voice) mediaType = 'voice';
+        else if (msg.document) mediaType = 'document';
+
+        await prisma.messageLog.create({
+            data: {
+                userId: dbUser.id,
+                chatId,
+                text: msg.text || msg.caption || '',
+                mediaType
+            }
+        });
+    }
+
+    private static async ensureUser(msg: TelegramBot.Message) {
+        const tUser = msg.from;
+        if (!tUser) return;
+
+        await prisma.user.upsert({
+            where: { telegramId: BigInt(tUser.id) },
+            update: {
+                username: tUser.username,
+                fullName: `${tUser.first_name || ''} ${tUser.last_name || ''}`.trim(),
+                lastActivity: new Date()
+            },
+            create: {
+                telegramId: BigInt(tUser.id),
+                username: tUser.username,
+                fullName: `${tUser.first_name || ''} ${tUser.last_name || ''}`.trim(),
+            }
+        });
+    }
+
+    private static async ensureGroup(msg: TelegramBot.Message) {
+        if (msg.chat.type === 'private') return;
+
+        await prisma.group.upsert({
+            where: { telegramId: msg.chat.id.toString() },
+            update: {
+                name: msg.chat.title || 'Unknown Group',
+            },
+            create: {
+                telegramId: msg.chat.id.toString(),
+                name: msg.chat.title || 'Unknown Group',
+                description: 'Telegram Group'
+            }
+        });
     }
 }

@@ -1,4 +1,4 @@
-import { ReplyKeyboardMarkup, KeyboardButton } from 'node-telegram-bot-api';
+import { ReplyKeyboardMarkup, InlineKeyboardMarkup } from 'node-telegram-bot-api';
 
 export const startKeyboard: ReplyKeyboardMarkup = {
     keyboard: [
@@ -30,4 +30,16 @@ export const attendanceKeyboard: ReplyKeyboardMarkup = {
         [{ text: "🏠 Asosiy menyu" }]
     ],
     resize_keyboard: true
+};
+
+export const groupInlineKeyboard: InlineKeyboardMarkup = {
+    inline_keyboard: [
+        [
+            { text: "👤 Profil", callback_data: "group_profile" },
+            { text: "✍️ Feedback", callback_data: "group_feedback" }
+        ],
+        [
+            { text: "👨‍🏫 AI Ustoz", callback_data: "group_ai_teacher" }
+        ]
+    ]
 };

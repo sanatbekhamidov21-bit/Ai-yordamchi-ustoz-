@@ -37,6 +37,7 @@ const setupBot = async () => {
     if (isBotSetup) return;
 
     bot.on('message', BotController.handleMessage);
+    bot.on('callback_query', BotController.handleCallback);
 
     if (process.env.NODE_ENV === 'development') {
         console.log('Bot starting in Polling mode...');

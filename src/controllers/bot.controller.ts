@@ -5,7 +5,7 @@ import redis from '../services/redis.service';
 import { teacherAgent } from '../agents/teacher.agent';
 import { smmAgent } from '../agents/smm.agent';
 import { sheetsService } from '../services/sheets.service';
-import { startKeyboard, teacherKeyboard, studentKeyboard, attendanceKeyboard } from '../utils/keyboards';
+import { startKeyboard, teacherKeyboard, studentKeyboard, attendanceKeyboard, groupInlineKeyboard } from '../utils/keyboards';
 import { CoinsController } from './coins.controller';
 
 export class BotController {
@@ -41,9 +41,18 @@ export class BotController {
             "📥 Vazifa yuborish", "👤 Profil", "🏠 Asosiy menyu"
         ];
 
-        if (!isPrivate && (menuButtons.includes(text) || text === '/start')) {
-            return bot.sendMessage(chatId, "Asosiy menyu faqat bot bilan shaxsiy yozishmada ishlaydi. Guruhda faqat # buyruqlarini ishlating.", {
-                reply_markup: { remove_keyboard: true }
+        if (!isPrivate && text === '/start') {
+            await BotController.ensureUser(msg);
+            await BotController.ensureGroup(msg);
+            return bot.sendMessage(chatId, "👋 Salom! Men sizning **Premium English** bo'yicha AI yordamchingizman.\n\nGuruhda quyidagi imkoniyatlardan foydalanishingiz mumkin:", {
+                parse_mode: 'Markdown',
+                reply_markup: groupInlineKeyboard
+            });
+        }
+
+        if (!isPrivate && menuButtons.includes(text)) {
+            return bot.sendMessage(chatId, "Asosiy menyu faqat bot bilan shaxsiy yozishmada ishlaydi. Quyidagi tugmalardan foydalaning:", {
+                reply_markup: groupInlineKeyboard
             });
         }
 
@@ -175,11 +184,18 @@ export class BotController {
             const user = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
             if (!user) return;
 
+            // Calculate Rank
+            const rank = await prisma.user.count({
+                where: { totalCoins: { gt: (user as any).totalCoins || 0 } }
+            } as any) + 1;
+            const totalUsers = await prisma.user.count({ where: { role: 'STUDENT' } } as any);
+
             let profile = `👤 **Foydalanuvchi Profili:**\n\n`;
             profile += `🆔 ID: \`${user.telegramId}\`\n`;
             profile += `👤 Ism: ${user.fullName}\n`;
             profile += `🎭 Rol: ${user.role}\n`;
-            profile += `💰 Jami Coinlar: ${user.totalCoins}\n`;
+            profile += `🏆 O'rin: **${rank}-o'rin** (jami ${totalUsers} ta o'quvchi orasida)\n`;
+            profile += `💰 Jami Coinlar: **${(user as any).totalCoins || 0}**\n`;
             profile += `📚 Topshirilgan vazifalar: ${user.totalHomeworks} ta\n`;
             profile += `📅 Ro'yxatdan o'tgan sana: ${user.joinDate.toLocaleDateString()}`;
 
@@ -491,10 +507,7 @@ export class BotController {
         return text.endsWith('?') || text.toLowerCase().includes('qanday') || text.toLowerCase().includes('nima');
     }
 
-    private static async handleQuestion(msg: TelegramBot.Message) {
-        const response = await teacherAgent.answerQuestion(msg.text!);
-        await bot.sendMessage(msg.chat.id, response, { reply_to_message_id: msg.message_id });
-    }
+
 
     private static async handleMultimodalSubmission(msg: TelegramBot.Message) {
         const userId = msg.from!.id;
@@ -590,12 +603,12 @@ export class BotController {
                     await sheetsService.markTask(sheetId, studentName!, evaluation.score >= 8 ? "to'liq" : "yarim");
 
                     // Increment in DB
-                    await prisma.user.update({
+                    await (prisma.user as any).update({
                         where: { id: dbUser.id },
                         data: { totalCoins: { increment: 5 } }
                     });
 
-                    coinMessage = `\n\n💰 Sizga 5 ta coin berildi! Jami coinlaringiz: ${(dbUser.totalCoins || 0) + 5}`;
+                    coinMessage = `\n\n💰 Sizga 5 ta coin berildi! Jami coinlaringiz: ${((dbUser as any).totalCoins || 0) + 5}`;
                 }
             }
 
@@ -635,11 +648,75 @@ export class BotController {
         await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
     }
 
-    private static async getGroupSheetId(chatId: number): Promise<string | null> {
-        const group = await prisma.group.findFirst({
-            where: { telegramId: chatId.toString() }
-        });
-        return group?.googleSheetId || process.env.GOOGLE_SHEETS_ID || null;
+    static async handleCallback(query: TelegramBot.CallbackQuery) {
+        const chatId = query.message?.chat.id;
+        const userId = query.from.id;
+        const data = query.data;
+
+        if (!chatId || !data) return;
+
+        if (data === 'group_profile') {
+            const user = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
+            if (!user) {
+                return bot.answerCallbackQuery(query.id, { text: "Avval botni shaxsiy xabarda ishga tushiring!", show_alert: true });
+            }
+
+            // Calculate Rank
+            const rank = await (prisma.user as any).count({
+                where: { totalCoins: { gt: (user as any).totalCoins || 0 } }
+            }) + 1;
+
+            const profile = `👤 ${user.fullName}\n🏆 O'rningiz: ${rank}-o'rin\n💰 Coinlar: ${(user as any).totalCoins || 0}\n📚 Vazifalar: ${user.totalHomeworks}`;
+            return bot.answerCallbackQuery(query.id, { text: profile, show_alert: true });
+        }
+
+        if (data === 'group_feedback') {
+            await redis.set(`user_state:${userId}`, 'WAITING_HW_DESC');
+            return bot.sendMessage(chatId, `✍️ @${query.from.username || query.from.first_name}, yaxshi! Endi feedback beriladigan materialni (matn, rasm yoki audio) yuboring.`, {
+                reply_markup: { inline_keyboard: [[{ text: "❌ Bekor qilish", callback_data: "cancel_state" }]] }
+            });
+        }
+
+        if (data === 'group_ai_teacher') {
+            await redis.set(`user_state:${userId}`, 'WAITING_QUESTION');
+            return bot.sendMessage(chatId, `👨‍🏫 @${query.from.username || query.from.first_name}, marhamat! Tushunmagan mavzuingiz yoki savolingizni yozing. Men guruhdagi oxirgi ma'lumotlar asosida javob beraman.`, {
+                reply_markup: { inline_keyboard: [[{ text: "❌ Bekor qilish", callback_data: "cancel_state" }]] }
+            });
+        }
+
+        if (data === 'cancel_state') {
+            await redis.del(`user_state:${userId}`);
+            return bot.deleteMessage(chatId, query.message!.message_id);
+        }
+
+        await bot.answerCallbackQuery(query.id);
+    }
+
+    private static async handleQuestion(msg: TelegramBot.Message) {
+        const chatId = msg.chat.id;
+        const text = msg.text || '';
+        const userId = msg.from!.id;
+
+        await bot.sendMessage(chatId, "🤔 Savolingizni tahlil qilyapman, biroz kuting...");
+
+        try {
+            // Fetch context from MessageLog
+            const recentLogs = await prisma.messageLog.findMany({
+                where: { chatId: chatId.toString() },
+                take: 10,
+                orderBy: { createdAt: 'desc' }
+            });
+
+            const context = recentLogs.reverse().map((log: any) => `${log.text}`).join('\n');
+            const fullPrompt = `Guruhdagi kontekst:\n${context}\n\nO'quvchi savoli: ${text}`;
+
+            const answer = await teacherAgent.answerQuestion(fullPrompt);
+            await bot.sendMessage(chatId, answer, { reply_to_message_id: msg.message_id });
+            await redis.del(`user_state:${userId}`);
+        } catch (error) {
+            console.error('AI Question error:', error);
+            await bot.sendMessage(chatId, "Kechirasiz, savolingizga javob berishda texnik xatolik yuz berdi.");
+        }
     }
 
     private static async logMessage(msg: TelegramBot.Message) {
@@ -655,7 +732,7 @@ export class BotController {
         else if (msg.voice) mediaType = 'voice';
         else if (msg.document) mediaType = 'document';
 
-        await prisma.messageLog.create({
+        await (prisma as any).messageLog.create({
             data: {
                 userId: dbUser.id,
                 chatId,
@@ -666,37 +743,40 @@ export class BotController {
     }
 
     private static async ensureUser(msg: TelegramBot.Message) {
-        const tUser = msg.from;
-        if (!tUser) return;
+        const user = msg.from;
+        if (!user) return;
 
         await prisma.user.upsert({
-            where: { telegramId: BigInt(tUser.id) },
-            update: {
-                username: tUser.username,
-                fullName: `${tUser.first_name || ''} ${tUser.last_name || ''}`.trim(),
-                lastActivity: new Date()
-            },
+            where: { telegramId: BigInt(user.id) },
+            update: { lastActivity: new Date(), username: user.username },
             create: {
-                telegramId: BigInt(tUser.id),
-                username: tUser.username,
-                fullName: `${tUser.first_name || ''} ${tUser.last_name || ''}`.trim(),
-            }
+                telegramId: BigInt(user.id),
+                username: user.username,
+                fullName: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
+                role: 'STUDENT',
+            },
         });
     }
 
     private static async ensureGroup(msg: TelegramBot.Message) {
         if (msg.chat.type === 'private') return;
+        const chatId = msg.chat.id.toString();
 
         await prisma.group.upsert({
-            where: { telegramId: msg.chat.id.toString() },
-            update: {
-                name: msg.chat.title || 'Unknown Group',
-            },
+            where: { telegramId: chatId },
+            update: { name: msg.chat.title || 'Guruh' },
             create: {
-                telegramId: msg.chat.id.toString(),
-                name: msg.chat.title || 'Unknown Group',
+                telegramId: chatId,
+                name: msg.chat.title || 'Guruh',
                 description: 'Telegram Group'
             }
         });
+    }
+
+    private static async getGroupSheetId(chatId: number): Promise<string | null> {
+        const group = await prisma.group.findFirst({
+            where: { telegramId: chatId.toString() }
+        });
+        return group?.googleSheetId || process.env.GOOGLE_SHEETS_ID || null;
     }
 }

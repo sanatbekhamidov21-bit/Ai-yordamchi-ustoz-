@@ -37,6 +37,12 @@ app.get('/health', (req, res) => res.send('OK'));
 // 4. Background setup
 const init = async () => {
     try {
+        console.log('Bot starting init...');
+        // Test DB connection
+        const prisma = (await import('./database/prisma')).default;
+        await prisma.$connect();
+        console.log('✅ Database connected successfully');
+
         if (process.env.NODE_ENV !== 'production' && process.env.BASE_WEBHOOK_URL) {
             const url = `${process.env.BASE_WEBHOOK_URL}/bot${process.env.BOT_TOKEN}`;
             await bot.setWebHook(url, { secret_token: process.env.SECRET_TOKEN });
@@ -44,7 +50,7 @@ const init = async () => {
         }
         SchedulerService.init();
     } catch (e) {
-        console.error('Init error:', e);
+        console.error('❌ Init error (Database or Webhook):', e);
     }
 };
 

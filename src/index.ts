@@ -60,11 +60,8 @@ if (process.env.NODE_ENV !== 'production') {
         await setupBot();
     });
 } else {
-    // In production (Vercel), we setup on the first request if not already done
-    app.use(async (req, res, next) => {
-        await setupBot();
-        next();
-    });
+    // In production (Vercel), setup once if possible, but don't block request flow
+    setupBot().catch(err => console.error('Setup failed:', err));
 }
 
 export default app;

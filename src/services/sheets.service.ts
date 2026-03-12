@@ -9,6 +9,8 @@ const CREDENTIALS_PATH = process.env.GOOGLE_CREDENTIALS_PATH || './credentials.j
 
 const VAZIFA_TAB = 'Vazifalar';
 const DAVOMAT_TAB = 'Davomat';
+const USERS_TAB = 'Foydalanuvchilar';
+const GROUPS_TAB = 'Guruhlar';
 
 class SheetsService {
     private sheets: sheets_v4.Sheets | null = null;
@@ -50,6 +52,8 @@ class SheetsService {
             const tabsToCreate: string[] = [];
             if (!existingTabs.includes(VAZIFA_TAB)) tabsToCreate.push(VAZIFA_TAB);
             if (!existingTabs.includes(DAVOMAT_TAB)) tabsToCreate.push(DAVOMAT_TAB);
+            if (!existingTabs.includes(USERS_TAB)) tabsToCreate.push(USERS_TAB);
+            if (!existingTabs.includes(GROUPS_TAB)) tabsToCreate.push(GROUPS_TAB);
 
             if (tabsToCreate.length > 0) {
                 await this.sheets.spreadsheets.batchUpdate({
@@ -62,31 +66,107 @@ class SheetsService {
                 });
 
                 for (const tab of tabsToCreate) {
-                    if (tab === VAZIFA_TAB) {
-                        await this.sheets.spreadsheets.values.update({
-                            spreadsheetId,
-                            range: `${VAZIFA_TAB}!A1:D1`,
-                            valueInputOption: 'USER_ENTERED',
-                            requestBody: {
-                                values: [['Ism', 'Vazifa Holati', 'Jami Coinlar', 'Oxirgi faollik sanasi']],
-                            },
-                        });
-                    } else if (tab === DAVOMAT_TAB) {
-                        await this.sheets.spreadsheets.values.update({
-                            spreadsheetId,
-                            range: `${DAVOMAT_TAB}!A1:D1`,
-                            valueInputOption: 'USER_ENTERED',
-                            requestBody: {
-                                values: [['Ism', 'Davomat soni', 'Jami Coinlar', 'Oxirgi faollik sanasi']],
-                            },
-                        });
-                    }
+                    let headers: string[] = [];
+                    if (tab === VAZIFA_TAB) headers = ['Ism', 'Vazifa Holati', 'Jami Coinlar', 'Oxirgi faollik sanasi'];
+                    else if (tab === DAVOMAT_TAB) headers = ['Ism', 'Davomat soni', 'Jami Coinlar', 'Oxirgi faollik sanasi'];
+                    else if (tab === USERS_TAB) headers = ['TelegramID', 'Ism', 'Username', 'Rol', 'Qo\'shilgan sana'];
+                    else if (tab === GROUPS_TAB) headers = ['ChatID', 'Guruh Nomi', 'Sheet ID'];
+
+                    await this.sheets.spreadsheets.values.update({
+                        spreadsheetId,
+                        range: `${tab}!A1`,
+                        valueInputOption: 'USER_ENTERED',
+                        requestBody: { values: [headers] },
+                    });
                 }
                 console.log(`✅ Yangi tablar yaratildi jadvalda: ${spreadsheetId}`);
             }
             this.initializedSheets.add(spreadsheetId);
         } catch (error) {
             console.error('Tab yaratishda xatolik:', error);
+        }
+    }
+
+    async upsertUser(spreadsheetId: string, userData: { telegramId: string, fullName: string, username?: string, role?: string }) {
+        if (!await this.init()) return;
+        await this.ensureTabs(spreadsheetId);
+
+        const rows = (await this.sheets!.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${USERS_TAB}!A:A`,
+        })).data.values || [];
+
+        const rowIndex = rows.findIndex(r => r[0] === userData.telegramId.toString()) + 1;
+        const today = new Date().toLocaleDateString('uz-UZ');
+
+        if (rowIndex === 0) {
+            await this.sheets!.spreadsheets.values.append({
+                spreadsheetId,
+                range: `${USERS_TAB}!A:E`,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: {
+                    values: [[userData.telegramId, userData.fullName, userData.username || '', userData.role || 'STUDENT', today]]
+                }
+            });
+        } else {
+            await this.sheets!.spreadsheets.values.update({
+                spreadsheetId,
+                range: `${USERS_TAB}!B${rowIndex}:D${rowIndex}`,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: {
+                    values: [[userData.fullName, userData.username || '', userData.role || 'STUDENT']]
+                }
+            });
+        }
+    }
+
+    async getUser(spreadsheetId: string, telegramId: string) {
+        if (!await this.init()) return null;
+        const rows = (await this.sheets!.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${USERS_TAB}!A:E`,
+        })).data.values || [];
+
+        const row = rows.find(r => r[0] === telegramId.toString());
+        if (!row) return null;
+        return {
+            telegramId: row[0],
+            fullName: row[1],
+            username: row[2],
+            role: row[3],
+            joinDate: row[4]
+        };
+    }
+
+    async upsertGroup(spreadsheetId: string, groupData: { chatId: string, name: string, sheetId: string }) {
+        if (!await this.init()) return;
+        await this.ensureTabs(spreadsheetId);
+
+        const rows = (await this.sheets!.spreadsheets.values.get({
+            spreadsheetId,
+            range: `${GROUPS_TAB}!A:A`,
+        })).data.values || [];
+
+        const rowIndex = rows.findIndex(r => r[0] === groupData.chatId.toString()) + 1;
+
+        if (rowIndex === 0) {
+            await this.sheets!.spreadsheets.values.append({
+                spreadsheetId,
+                range: `${GROUPS_TAB}!A:C`,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: {
+                    values: [[groupData.chatId, groupData.name, groupData.sheetId]]
+                }
+            });
+        } else {
+            await this.sheets!.spreadsheets.values.update({
+                spreadsheetId,
+                range: `${GROUPS_TAB}!B${rowIndex}:C${rowIndex}`,
+                valueInputOption: 'USER_ENTERED',
+                requestBody: {
+                    values: [[groupData.name, groupData.sheetId]]
+                }
+            });
         }
     }
 

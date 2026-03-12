@@ -1,6 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
 import bot from '../services/bot.service';
-import prisma from '../database/prisma';
 import redis from '../services/redis.service';
 import { teacherAgent } from '../agents/teacher.agent';
 import { smmAgent } from '../agents/smm.agent';
@@ -8,68 +7,48 @@ import { sheetsService } from '../services/sheets.service';
 import { startKeyboard, teacherKeyboard, studentKeyboard, attendanceKeyboard, groupInlineKeyboard } from '../utils/keyboards';
 import { CoinsController } from './coins.controller';
 
+const MAIN_SHEET_ID = process.env.GOOGLE_SHEETS_ID || '';
+
 export class BotController {
     static async handleMessage(msg: TelegramBot.Message) {
         const chatId = msg.chat.id;
         const text = msg.text || msg.caption || '';
         const userId = msg.from?.id;
 
-        console.log(`📩 Xabar keldi: [${msg.chat.type}] chatId=${chatId} from=${userId} text="${text}" media=${msg.photo ? 'photo' : msg.voice ? 'voice' : msg.document ? 'doc' : 'none'}`);
-
         if (!userId) return;
 
-        // 0. Handle Submissions in Private Chat
-        if (msg.chat.type === 'private' && (msg.photo || msg.voice || msg.document || (text && text.length > 20 && !text.startsWith('/')))) {
-            await BotController.logMessage(msg);
+        console.log(`📩 Xabar keldi: [${msg.chat.type}] chatId=${chatId} text="${text.substring(0, 30)}..."`);
+
+        // 1. Ensure User & Group (in Google Sheets)
+        await BotController.ensureUser(msg);
+        if (msg.chat.type !== 'private') {
+            await BotController.ensureGroup(msg);
+        }
+
+        // 2. Handle Submissions in Private Chat
+        const isPrivate = msg.chat.type === 'private';
+        if (isPrivate && (msg.photo || msg.voice || msg.document || (text && text.length > 20 && !text.startsWith('/')))) {
             return BotController.handlePrivateSubmission(msg);
         }
 
-        await BotController.logMessage(msg);
-
-        // 0. Hashtag-based coin/attendance commands (group messages)
+        // 3. Hashtag-based coin commands
         if (text.startsWith('#')) {
             const handled = await CoinsController.handleHashtagMessage(msg);
             if (handled) return;
         }
 
-        const isPrivate = msg.chat.type === 'private';
-
-        // 0.1 Clear keyboards in groups for specific menu buttons
-        const menuButtons = [
-            "👨‍🏫 O'qituvchi", "👨‍🎓 O'quvchi", "🤖 AI Boshqaruv",
-            "📊 Statistika", "➕ Guruh yaratish", "📝 Vazifa berish",
-            "📥 Vazifa yuborish", "👤 Profil", "🏠 Asosiy menyu"
-        ];
-
-        if (!isPrivate && text === '/start') {
-            await BotController.ensureUser(msg);
-            await BotController.ensureGroup(msg);
-            return bot.sendMessage(chatId, "👋 Salom! Men sizning **Premium English** bo'yicha AI yordamchingizman.\n\nGuruhda quyidagi imkoniyatlardan foydalanishingiz mumkin:", {
-                parse_mode: 'Markdown',
-                reply_markup: groupInlineKeyboard
-            });
-        }
-
-        if (!isPrivate && menuButtons.includes(text)) {
-            return bot.sendMessage(chatId, "Asosiy menyu faqat bot bilan shaxsiy yozishmada ishlaydi. Quyidagi tugmalardan foydalaning:", {
-                reply_markup: groupInlineKeyboard
-            });
-        }
-
-        // 1. Registry
-        await BotController.ensureUser(msg);
-        await BotController.ensureGroup(msg);
-
         const state = await redis.get(`user_state:${userId}`);
 
-        // 2. Global Escape Hatch & Commands
+        // 4. Global Commands
         if (text === '/start' || text === '🏠 Asosiy menyu') {
             await redis.del(`user_state:${userId}`);
-            await redis.del(`hw_group:${userId}`);
-            await redis.del(`group_name:${userId}`);
 
-            const user = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
+            const user = await sheetsService.getUser(MAIN_SHEET_ID, userId.toString());
             const keyboard = user?.role === 'ADMIN' ? teacherKeyboard : (user ? studentKeyboard : startKeyboard);
+
+            if (!isPrivate) {
+                return bot.sendMessage(chatId, "👋 Salom! Bot guruhda faol.", { reply_markup: groupInlineKeyboard });
+            }
             return bot.sendMessage(chatId, "Kerakli panelni tanlang:", { reply_markup: keyboard });
         }
 
@@ -77,98 +56,24 @@ export class BotController {
             return BotController.handlePassword(msg);
         }
 
-        // 3. AI Management Flow
-        if (state === 'WAITING_AI_CMD') {
-            return BotController.handleAiCommand(msg);
-        }
-
-        if (state === 'WAITING_GROUP_NAME') {
-            await redis.set(`group_name:${userId}`, text);
-            await redis.set(`user_state:${userId}`, 'WAITING_GROUP_DESC');
-            return bot.sendMessage(chatId, "Guruh tavsifini kiriting (vazifalari, maqsadi qanaqa?):");
-        }
-
-        if (state === 'WAITING_GROUP_DESC') {
-            const name = await redis.get(`group_name:${userId}`);
-            if (name) {
-                await prisma.group.create({ data: { name, description: text } });
-                await bot.sendMessage(chatId, `✅ Guruh yaratildi: ${name}`, {
-                    reply_markup: isPrivate ? teacherKeyboard : { remove_keyboard: true }
-                });
-            }
-            await redis.del(`group_name:${userId}`);
-            await redis.del(`user_state:${userId}`);
-            return;
-        }
-
-        if (state === 'WAITING_HW_DESC') {
-            return BotController.handleHwCreation(msg);
-        }
-
-        if (state === 'WAITING_ATTENDANCE_NAME') {
-            await redis.del(`user_state:${userId}`);
-            const sheetId = await BotController.getGroupSheetId(chatId);
-            if (!sheetId) return bot.sendMessage(chatId, "Kechirasiz, guruh jadvali topilmadi. Admin bilan bog'laning.");
-
-            await bot.sendMessage(chatId, "⏳ Davomat belgilanmoqda...");
-            const result = await sheetsService.markAttendance(sheetId, text);
-            if (result) {
-                const totalCoins = await sheetsService.getTotalCoins(sheetId, text);
-                const rank = await sheetsService.getStudentRank(sheetId, text);
-                return bot.sendMessage(chatId, `✅ Barakalla, ${text}! Davomat belgilandi.\n💰 +5 coin! Jami: ${totalCoins}\n🏆 Reyting: ${rank}-o'rin`, { reply_markup: studentKeyboard });
-            } else {
-                return bot.sendMessage(chatId, "❌ Xatolik yuz berdi. Qaytadan urinib ko'ring.", { reply_markup: studentKeyboard });
-            }
-        }
-
-        // Buttons
+        // 5. Menu Buttons
         if (text === "👨‍🏫 O'qituvchi") {
-            const user = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
+            const user = await sheetsService.getUser(MAIN_SHEET_ID, userId.toString());
             if (user?.role === 'ADMIN') {
-                return bot.sendMessage(chatId, "Xush kelibsiz, Ustoz!", {
-                    reply_markup: isPrivate ? teacherKeyboard : { remove_keyboard: true }
-                });
+                return bot.sendMessage(chatId, "Xush kelibsiz, Ustoz!", { reply_markup: teacherKeyboard });
             }
             await redis.set(`user_state:${userId}`, 'WAITING_PASSWORD');
             return bot.sendMessage(chatId, "O'qituvchi paneliga kirish uchun maxfiy kodni kiriting:");
         }
 
         if (text === "👨‍🎓 O'quvchi") {
-            return bot.sendMessage(chatId, "O'quvchi paneli faollashtirildi. Dars qilishni unutmang!", {
-                reply_markup: isPrivate ? studentKeyboard : { remove_keyboard: true }
-            });
-        }
-
-        if (text === "🤖 AI Boshqaruv") {
-            await redis.set(`user_state:${userId}`, 'WAITING_AI_CMD');
-            return bot.sendMessage(chatId, "🤖 AI paneli ochiq.\nBuyruq yozing: Post tayyorlash, o'quvchilarni tahlil qilish kabilar...");
-        }
-
-        if (text === "➕ Guruh yaratish") {
-            await redis.set(`user_state:${userId}`, 'WAITING_GROUP_NAME');
-            return bot.sendMessage(chatId, "Yangi guruh nomini kiriting:");
-        }
-
-        if (text === "📝 Vazifa berish") {
-            const groups = await prisma.group.findMany();
-            if (groups.length === 0) return bot.sendMessage(chatId, "Hali guruhlar yo'q! Oldin guruh yarating.");
-            let keyboard = groups.map((g: any) => [{ text: `/set_group ${g.id} ${g.name}` }]);
-            keyboard.push([{ text: "🏠 Asosiy menyu" }]);
-            return bot.sendMessage(chatId, "Qaysi guruhga vazifa beramiz?", { reply_markup: { keyboard, resize_keyboard: true } });
-        }
-
-        if (text.startsWith("/set_group")) {
-            const parts = text.split(" ");
-            const groupId = parts[1];
-            await redis.set(`user_state:${userId}`, 'WAITING_HW_DESC');
-            await redis.set(`hw_group:${userId}`, groupId);
-            return bot.sendMessage(chatId, "Vazifani quyidagi formatda yozing:\n\n#HW <raqam>\nTopshiriq 1]\nTopshiriq 2]\nDeadline HH:MM\n\nMisol:\n#HW15\n1] Ingliz tilida 5 ta gap..\nDeadline 20:00", {
-                reply_markup: isPrivate ? teacherKeyboard : { remove_keyboard: true }
-            });
+            return bot.sendMessage(chatId, "O'quvchi paneli faollashtirildi.", { reply_markup: studentKeyboard });
         }
 
         if (text === "📊 Statistika") {
-            return BotController.showProgress(msg);
+            const coins = await sheetsService.getTotalCoins(MAIN_SHEET_ID, msg.from?.first_name || 'User');
+            const rank = await sheetsService.getStudentRank(MAIN_SHEET_ID, msg.from?.first_name || 'User');
+            return bot.sendMessage(chatId, `📊 **Sizning ko'rsatkichlaringiz:**\n\n💰 Jami coinlar: ${coins}\n🏆 Reyting: ${rank}-o'rin`, { parse_mode: 'Markdown' });
         }
 
         if (text === "📅 Davomat") {
@@ -176,499 +81,84 @@ export class BotController {
             return bot.sendMessage(chatId, "Ism va familiyangizni yuboring:", { reply_markup: attendanceKeyboard });
         }
 
-        if (text === "✍️ Vazifa topshirish") {
-            return bot.sendMessage(chatId, "📥 Yaxshi, vazifangiz matnini yoki rasmini/audiosini shu yerga tashlang. AI tahlil qilib, coin hisoblaydi!", { reply_markup: studentKeyboard });
+        if (state === 'WAITING_ATTENDANCE_NAME') {
+            await redis.del(`user_state:${userId}`);
+            await bot.sendMessage(chatId, "⏳ Davomat belgilanmoqda...");
+            const result = await sheetsService.markAttendance(MAIN_SHEET_ID, text);
+            if (result) {
+                return bot.sendMessage(chatId, `✅ Davomat belgilandi! +5 coin.`, { reply_markup: studentKeyboard });
+            }
         }
 
         if (text === "👤 Profil") {
-            const user = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
-            if (!user) return;
+            const user = await sheetsService.getUser(MAIN_SHEET_ID, userId.toString());
+            const coins = await sheetsService.getTotalCoins(MAIN_SHEET_ID, user?.fullName || 'User');
+            const rank = await sheetsService.getStudentRank(MAIN_SHEET_ID, user?.fullName || 'User');
 
-            // Calculate Rank
-            const rank = await prisma.user.count({
-                where: { totalCoins: { gt: (user as any).totalCoins || 0 } }
-            } as any) + 1;
-            const totalUsers = await prisma.user.count({ where: { role: 'STUDENT' } } as any);
-
-            let profile = `👤 **Foydalanuvchi Profili:**\n\n`;
-            profile += `🆔 ID: \`${user.telegramId}\`\n`;
-            profile += `👤 Ism: ${user.fullName}\n`;
-            profile += `🎭 Rol: ${user.role}\n`;
-            profile += `🏆 O'rin: **${rank}-o'rin** (jami ${totalUsers} ta o'quvchi orasida)\n`;
-            profile += `💰 Jami Coinlar: **${(user as any).totalCoins || 0}**\n`;
-            profile += `📚 Topshirilgan vazifalar: ${user.totalHomeworks} ta\n`;
-            profile += `📅 Ro'yxatdan o'tgan sana: ${user.joinDate.toLocaleDateString()}`;
-
+            let profile = `👤 **Profil:**\n\nIsm: ${user?.fullName}\nRol: ${user?.role}\n💰 Coinlar: ${coins}\n🏆 Reyting: ${rank}-o'rin`;
             return bot.sendMessage(chatId, profile, { parse_mode: 'Markdown' });
         }
 
-        if (text === "/ai feedback" || text.toLowerCase() === "feedback") {
-            const lastSubHw = await redis.get(`last_hw:${userId}`);
-            if (lastSubHw) {
-                const evaluationStr = await redis.get(`eval_${userId}_${lastSubHw}`);
-                if (evaluationStr) {
-                    return bot.sendMessage(chatId, `🤖 AI Feedback:\n\n${evaluationStr}`);
-                }
-            }
-            return bot.sendMessage(chatId, "Feedback uchun oxirgi vazifa topilmadi.");
-        }
-
-        if (text.startsWith('/')) {
-            return BotController.handleCommand(msg);
-        }
-
-        // Detect Submissions (Group-specific)
-        if (!isPrivate) {
-            const group = await prisma.group.findFirst({ where: { telegramId: chatId.toString() } });
-            if (group) {
-                const activeHwId = await redis.get(`active_hw_id:${group.id}`);
-                if (activeHwId && text.length > 20) {
-                    await BotController.logMessage(msg);
-                    return bot.sendMessage(chatId, "✅ Vazifa qabul qilindi! AI tahlilini kuting...");
-                }
-            }
-        }
-
-        // 7. Question Handling (Safety check first)
+        // 6. Question Analysis
         if (BotController.isQuestion(text)) {
-            return BotController.handleQuestion(msg);
+            await bot.sendMessage(chatId, "🤔 Savolingizni tahlil qilyapman...");
+            const answer = await teacherAgent.answerQuestion(text);
+            return bot.sendMessage(chatId, answer, { reply_to_message_id: msg.message_id });
         }
-    }
-
-    private static async safeSendMessage(chatId: number, text: string, options: any = {}) {
-        try {
-            return await bot.sendMessage(chatId, text, options);
-        } catch (error: any) {
-            // Check if it's a markdown parsing error
-            if (error.response?.body?.description?.includes("can't parse entities")) {
-                console.warn("Markdown parsing failed, falling back to plain text.");
-                // Remove parse_mode and try again
-                const { parse_mode, ...plainOptions } = options;
-                return await bot.sendMessage(chatId, text, plainOptions);
-            }
-            throw error;
-        }
-    }
-
-
-
-
-    private static async handlePassword(msg: TelegramBot.Message) {
-        const userId = msg.from!.id;
-        const chatId = msg.chat.id;
-        if (msg.text === 'SANATBEK_PRO' || msg.text === 'admin') {
-            await prisma.user.update({
-                where: { telegramId: BigInt(userId) },
-                data: { role: 'ADMIN' }
-            });
-            await redis.del(`user_state:${userId}`);
-            const isPrivate = msg.chat.type === 'private';
-            return bot.sendMessage(chatId, "Kirish muvaffaqiyatli! O'qituvchi paneli ochildi.", {
-                reply_markup: isPrivate ? teacherKeyboard : { remove_keyboard: true }
-            });
-        } else {
-            return bot.sendMessage(chatId, "Xato kod! Qaytadan urinib ko'ring yoki /start bosing.");
-        }
-    }
-
-    private static async handleAiCommand(msg: TelegramBot.Message) {
-        const userId = msg.from!.id;
-        const chatId = msg.chat.id;
-        const command = msg.text || '';
-        const lowerCmd = command.toLowerCase();
-
-        if (lowerCmd.includes('quiz') || lowerCmd.includes('test') || lowerCmd.includes("so'rovnoma")) {
-            return BotController.handleAiQuiz(chatId, command);
-        }
-
-        await bot.sendMessage(chatId, "🤖 AI o'ylamoqda...");
-
-        if (lowerCmd.includes('post') || lowerCmd.includes('xabar') || lowerCmd.includes('kanal')) {
-            const customPost = await smmAgent.generateManualPost(command);
-            return bot.sendMessage(chatId, customPost, { parse_mode: 'Markdown' });
-        }
-
-        if (lowerCmd.includes('tahlil') || lowerCmd.includes('analiz') || lowerCmd.includes("o'quvchi")) {
-            return BotController.handleAiStudentAnalysis(chatId);
-        }
-
-        if (lowerCmd.includes('statistika') || lowerCmd.includes('natija')) {
-            return BotController.handleAiStatsAnalysis(chatId);
-        }
-
-        // Fallback to conversational AI if the action wasn't matched strictly.
-        const ans = await teacherAgent.generateContent(`O'qituvchining yuborgan shaxsiy gapiga yoki buyrug'iga toza o'zbek tilida mos, mehribon va aqlli yordamchi sifatida javob ber. Savol yoki gap: "${command}"`);
-        await bot.sendMessage(chatId, `🤖: ${ans}`);
-    }
-
-    private static async handleCommand(msg: TelegramBot.Message) {
-        const text = msg.text || '';
-        const chatId = msg.chat.id;
-
-        if (text === '/start') {
-            await bot.sendMessage(chatId, "Assalomu alaykum! Men sizning AI Teacher Assistant botingizman.");
-        }
-
-        // Admin commands check
-        const user = await prisma.user.findUnique({ where: { telegramId: BigInt(msg.from!.id) } });
-        if (user?.role !== 'ADMIN') {
-            if (text === '/progress') {
-                return BotController.showProgress(msg);
-            }
-            return;
-        }
-
-        if (text.startsWith('/link_sheet')) {
-            if (msg.chat.type === 'private') {
-                return bot.sendMessage(chatId, "Ushbu buyruqni guruh ichida yozishingiz kerak!");
-            }
-            const sheetId = text.replace('/link_sheet', '').trim();
-            if (!sheetId) return bot.sendMessage(chatId, "Google Sheet ID sini kiriting.\nMisol: `/link_sheet 1ehQX...`", { parse_mode: 'Markdown' });
-
-            const existing = await prisma.group.findFirst({ where: { telegramId: chatId.toString() } });
-            if (existing) {
-                await prisma.group.update({
-                    where: { id: existing.id },
-                    data: { googleSheetId: sheetId, name: msg.chat.title || 'Guruh' }
-                });
-            } else {
-                await prisma.group.create({
-                    data: { telegramId: chatId.toString(), googleSheetId: sheetId, name: msg.chat.title || 'Guruh', description: 'Guruh' }
-                });
-            }
-            return bot.sendMessage(chatId, `✅ Ushbu guruh uchun alohida Google Sheet bog'landi!\n\nID: \`${sheetId}\``, { parse_mode: 'Markdown' });
-        }
-
-        if (text.startsWith('/admin_post')) {
-            const topic = text.replace('/admin_post', '').trim();
-            const post = await smmAgent.generateManualPost(topic || 'Grammar tip');
-            // Assume channel ID is set in ENV
-            const channelId = process.env.CHANNEL_ID;
-            if (channelId) await bot.sendMessage(channelId, post);
-            else await bot.sendMessage(chatId, "Channel ID sozlanmagan.");
-        }
-
-        if (text === '/students') {
-            const students = await prisma.user.findMany({ where: { role: 'STUDENT' } });
-            let response = "O'quvchilar ro'yxati:\n";
-            students.forEach((s: any) => response += `- ${s.fullName} (@${s.username || 'n/a'})\n`);
-            await bot.sendMessage(chatId, response);
-        }
-
-        if (text.startsWith('/ai')) {
-            const command = text.replace('/ai', '').trim();
-            if (!command) return bot.sendMessage(chatId, "AI uchun buyruqni kiriting. Masalan: /ai o'quvchilarni tahlil qil");
-
-            const interpretation = await teacherAgent.interpretCommand(command);
-
-            switch (interpretation.action) {
-                case 'STUDENT_ANALYSIS':
-                    return BotController.handleAiStudentAnalysis(chatId);
-                case 'POST_PLAN':
-                    return BotController.handleAiPostPlanning(chatId);
-                case 'STATS':
-                    return BotController.handleAiStatsAnalysis(chatId);
-                default:
-                    await bot.sendMessage(chatId, `🤖 AI: ${interpretation.suggestion}`);
-            }
-        }
-    }
-
-    private static async handleAiStudentAnalysis(chatId: number) {
-        const students = await prisma.user.findMany();
-        const active = students.filter((s: any) => s.totalHomeworks > 0);
-        const passive = students.filter((s: any) => s.totalHomeworks === 0);
-
-        let report = "📊 **O'quvchilar tahlili (AI):**\n\n";
-        report += `✅ Faol (vazifa topshirgan): ${active.length} ta\n`;
-        report += `❌ Noaktiv: ${passive.length} ta\n\n`;
-
-        if (passive.length > 0) {
-            report += "Tavsiya: Noaktiv o'quvchilarga eslatma yuborish kerak.";
-        }
-
-        await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
-    }
-
-    private static async handleAiPostPlanning(chatId: number) {
-        const posts = await prisma.channelPost.findMany({ take: 5, orderBy: { postedAt: 'desc' } });
-        const suggestion = await smmAgent.generateDailyPost(posts.map((p: any) => p.content), {});
-
-        await bot.sendMessage(chatId, `📝 **AI tavsiya qilgan yangi post rejasi:**\n\n${suggestion}`, { parse_mode: 'Markdown' });
-    }
-
-    private static async handleAiQuiz(chatId: number, topic: string) {
-        await bot.sendMessage(chatId, "⏳ AI test tuzmoqda, ozgina kuting...");
-        const quiz = await smmAgent.generateQuiz(topic);
-        if (!quiz || !quiz.options || quiz.options.length < 2) {
-            return bot.sendMessage(chatId, "❌ Kechirasiz, quiz yarata olmadim. Boshqa mavzu berib ko'ring.");
-        }
-        await bot.sendPoll(chatId, quiz.question, quiz.options, { is_anonymous: false });
-    }
-
-    private static async handleAiStatsAnalysis(chatId: number) {
-        const submissions = await prisma.submission.findMany();
-        const avgScore = submissions.reduce((acc: number, curr: any) => acc + (curr.score || 0), 0) / (submissions.length || 1);
-
-        let report = "📈 **Umumiy statistika tahlili:**\n\n";
-        report += `🔹 Jami topshiriqlar: ${submissions.length} ta\n`;
-        report += `🔹 O'rtacha o'zlashtirish: ${avgScore.toFixed(1)}%\n`;
-        report += `\nAI xulosasi: O'quvchilar darslarni ${avgScore > 70 ? 'yaxshi' : 'o\'rtacha'} o'zlashtirmoqda.`;
-
-        await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
-    }
-
-    private static async handleHwCreation(msg: TelegramBot.Message) {
-        const text = msg.text || '';
-        const match = text.match(/#HW(\d+)\n([\s\S]+)\nDeadline\s+(\d{2}:\d{2})/i);
-        const userId = msg.from!.id;
-
-        if (!match) {
-            return bot.sendMessage(msg.chat.id, "HW formati noto'g'ri. Misol:\n#HW12\n1] Matn...\nDeadline 22:00");
-        }
-
-        const hwNumber = parseInt(match[1]);
-        const description = match[2].trim();
-        const deadlineTime = match[3];
-
-        const groupId = await redis.get(`hw_group:${userId}`);
-
-        // Calculate deadline Date
-        const deadline = new Date();
-        const [hours, minutes] = deadlineTime.split(':').map(Number);
-        deadline.setHours(hours, minutes, 0, 0);
-        if (deadline < new Date()) deadline.setDate(deadline.getDate() + 1);
-
-        const hw = await prisma.homework.upsert({
-            where: { hwNumber },
-            update: { description, deadline, isActive: true, groupId },
-            create: { hwNumber, description, deadline, groupId },
-        });
-
-        await redis.set(`active_hw_id:${hw.groupId}`, hw.id);
-        await redis.set(`hw_deadline:${hw.id}`, deadline.toISOString());
-
-        await redis.del(`user_state:${userId}`);
-        await redis.del(`hw_group:${userId}`);
-
-        const isPrivate = msg.chat.type === 'private';
-        await bot.sendMessage(msg.chat.id, `✅ Vazifa qabul qilindi: #HW${hwNumber} (${new Date(deadline).toLocaleString()})\n\nGuruh o'quvchilari endi topshirishi mumkin!`, {
-            reply_markup: isPrivate ? teacherKeyboard : { remove_keyboard: true }
-        });
     }
 
     private static async handlePrivateSubmission(msg: TelegramBot.Message) {
         const userId = msg.from!.id;
         const chatId = msg.chat.id;
+        const userName = msg.from!.first_name;
 
-        const dbUser = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
-        if (!dbUser) return;
+        // 1. Give Coins (In Sheets)
+        await sheetsService.markTask(MAIN_SHEET_ID, userName, "to'liq");
 
-        // 1. Give Coins & Update Stats
-        await prisma.user.update({
-            where: { id: dbUser.id },
-            data: {
-                totalHomeworks: { increment: 1 },
-                totalCoins: { increment: 5 }
-            }
-        });
-
-        // 2. Forward to Group (Vazifalar bo'limi)
+        // 2. Forward to Group
         const groupId = process.env.GROUP_ID;
-        const topicId = process.env.VAZIFALAR_TOPIC_ID; // Forum Topic ID
+        const topicId = process.env.VAZIFALAR_TOPIC_ID;
 
         if (groupId) {
-            const caption = `📥 **Yangi vazifa topshirildi!**\n\n👤 O'quvchi: ${dbUser.fullName}\n🆔 ID: \`${userId}\`\n💰 Mukofot: +5 coin`;
-
+            const caption = `📥 **Yangi vazifa topshirildi!**\n👤: ${userName}\n💰 Mukofot: +5 coin`;
             try {
                 if (msg.photo) {
-                    await bot.sendPhoto(groupId, msg.photo[msg.photo.length - 1].file_id, {
-                        caption, parse_mode: 'Markdown', message_thread_id: topicId ? parseInt(topicId) : undefined
-                    });
+                    await bot.sendPhoto(groupId, msg.photo[msg.photo.length - 1].file_id, { caption, message_thread_id: topicId ? parseInt(topicId) : undefined });
                 } else if (msg.voice) {
-                    await bot.sendVoice(groupId, msg.voice.file_id, {
-                        caption, parse_mode: 'Markdown', message_thread_id: topicId ? parseInt(topicId) : undefined
-                    });
-                } else if (msg.text) {
-                    await bot.sendMessage(groupId, `${caption}\n\n📝 Matn:\n${msg.text}`, {
-                        parse_mode: 'Markdown', message_thread_id: topicId ? parseInt(topicId) : undefined
-                    });
+                    await bot.sendVoice(groupId, msg.voice.file_id, { caption, message_thread_id: topicId ? parseInt(topicId) : undefined });
+                } else {
+                    await bot.sendMessage(groupId, `${caption}\n\n📝:\n${msg.text || msg.caption}`, { message_thread_id: topicId ? parseInt(topicId) : undefined });
                 }
-            } catch (e) {
-                console.error("Guruhga yuborishda xatolik:", e);
-            }
+            } catch (e) { console.error("Forward error:", e); }
         }
 
-        // 3. Ask for Feedback
-        // Temporarily store message data for feedback in Redis
-        let mediaData = '';
-        if (msg.photo) mediaData = `photo:${msg.photo[msg.photo.length - 1].file_id}`;
-        else if (msg.voice) mediaData = `voice:${msg.voice.file_id}`;
-
+        // 3. Feedback Option
+        let mediaData = msg.photo ? `photo:${msg.photo[msg.photo.length - 1].file_id}` : (msg.voice ? `voice:${msg.voice.file_id}` : '');
         await redis.set(`pending_fb_text:${userId}`, msg.text || msg.caption || '');
         await redis.set(`pending_fb_media:${userId}`, mediaData);
 
-        return bot.sendMessage(chatId, `✅ **Vazifangiz qabul qilindi!**\n\n💰 Sizga **+5 coin** berildi. Jami: ${((dbUser as any).totalCoins || 0) + 5}\n📂 Vazifa guruhga yuborildi.\n\n🤖 Professional AI feedback beraymi?`, {
-            parse_mode: 'Markdown',
+        return bot.sendMessage(chatId, `✅ **Vazifangiz qabul qilindi!**\n💰 +5 coin berildi.\n🤖 AI feedback berilsinmi?`, {
             reply_markup: {
                 inline_keyboard: [
-                    [{ text: "✅ Ha, feedback berish", callback_data: `get_fb_${userId}` }],
-                    [{ text: "❌ Shart emas", callback_data: "no_fb" }]
+                    [{ text: "✅ Ha", callback_data: `get_fb_${userId}` }],
+                    [{ text: "❌ Yo'q", callback_data: "no_fb" }]
                 ]
             }
         });
     }
 
-    private static isSubmission(text: string): boolean {
-        return text.length > 20;
-    }
-
-    private static isQuestion(text: string): boolean {
-        // Ignore short words, links, etc.
-        if (text.length < 10) return false;
-        if (text.includes('http')) return false;
-        return text.endsWith('?') || text.toLowerCase().includes('qanday') || text.toLowerCase().includes('nima');
-    }
-
-
-
-    private static async handleMultimodalSubmission(msg: TelegramBot.Message) {
+    private static async handlePassword(msg: TelegramBot.Message) {
         const userId = msg.from!.id;
-        const chatId = msg.chat.id.toString();
-        const feedbackModeName = await redis.get(`user_feedback_mode:${userId}`);
-
-        let activeHwId: string | null = null;
-        let groupRecord: any = null;
-
-        if (msg.chat.type !== 'private') {
-            groupRecord = await prisma.group.findFirst({ where: { telegramId: chatId } });
-            if (groupRecord) {
-                activeHwId = await redis.get(`active_hw_id:${groupRecord.id}`);
-            }
-        } else {
-            // In PV, we use a global fallback for now or the student's primary group
-            activeHwId = await redis.get('active_hw_id');
-        }
-
-        // Only proceed if it's either an active HW submission or student is in Feedback Mode
-        if (!activeHwId && !feedbackModeName) return;
-
-        const dbUser = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
-        if (!dbUser) return;
-
-        let taskDescription = 'General English practice/feedback';
-        let hw: any = null;
-
-        if (activeHwId && !feedbackModeName) {
-            hw = await prisma.homework.findUnique({ where: { id: activeHwId } });
-            if (hw) taskDescription = hw.description;
-        }
-
-        const isFeedbackMode = !!feedbackModeName;
-        const processingMsg = isFeedbackMode
-            ? "Ajoyib vazifangizni tekshirayapman, tez orada tahlil qilib beraman. 🧐"
-            : "🧐 Vazifangizni qabul qildim. Senior Teacher tahlil qilmoqda, iltimos kuting...";
-
-        await bot.sendMessage(msg.chat.id, processingMsg, { reply_to_message_id: msg.message_id });
-
-        try {
-            let fileId = '';
-            let mimeType = '';
-
-            if (msg.photo) {
-                fileId = msg.photo[msg.photo.length - 1].file_id;
-                mimeType = 'image/jpeg';
-            } else if (msg.voice) {
-                fileId = msg.voice.file_id;
-                mimeType = msg.voice.mime_type || 'audio/ogg';
-            } else if (msg.document) {
-                fileId = msg.document.file_id;
-                mimeType = msg.document.mime_type || 'application/octet-stream';
-            }
-
-            const fileLink = await bot.getFileLink(fileId);
-            const response = await fetch(fileLink);
-            const buffer = await response.arrayBuffer();
-            const base64 = Buffer.from(buffer).toString('base64');
-
-            const evaluation = await teacherAgent.evaluateHomework(msg.caption || '', taskDescription, [
-                { data: base64, mimeType }
-            ]);
-
-            // If it was a HW, save it
-            if (hw) {
-                await prisma.submission.create({
-                    data: {
-                        userId: dbUser.id,
-                        hwId: hw.id,
-                        text: msg.caption || '[Media Submission]',
-                        score: evaluation.score,
-                        feedback: `${evaluation.correction}\n\nMaslahat: ${evaluation.advice}`,
-                    },
-                });
-
-                await prisma.user.update({
-                    where: { id: dbUser.id },
-                    data: { totalHomeworks: { increment: 1 } }
-                });
-            }
-
-            // Automatic Coin Awarding
-            let coinMessage = '';
-            if (evaluation.score >= 5) {
-                const group = groupRecord || await prisma.group.findFirst({ where: { telegramId: msg.chat.id.toString() } });
-                const sheetId = group?.googleSheetId || process.env.GOOGLE_SHEETS_ID;
-                if (sheetId) {
-                    const studentName = (isFeedbackMode && feedbackModeName !== 'unnamed')
-                        ? feedbackModeName
-                        : (dbUser.fullName || dbUser.username || 'Student');
-
-                    await sheetsService.markTask(sheetId, studentName!, evaluation.score >= 8 ? "to'liq" : "yarim");
-
-                    // Increment in DB
-                    await (prisma.user as any).update({
-                        where: { id: dbUser.id },
-                        data: { totalCoins: { increment: 5 } }
-                    });
-
-                    coinMessage = `\n\n💰 Sizga 5 ta coin berildi! Jami coinlaringiz: ${((dbUser as any).totalCoins || 0) + 5}`;
-                }
-            }
-
-            const header = isFeedbackMode ? `🌟 **Professional Feedback** 🌟\n\n` : `✅ Media vazifa qabul qilindi!\n\n`;
-
-            await BotController.safeSendMessage(msg.chat.id, `${header}${evaluation.correction}\n\n💡 Maslahat: ${evaluation.advice}${coinMessage}`, {
-                reply_to_message_id: msg.message_id,
-                parse_mode: 'Markdown'
+        if (msg.text === 'SANATBEK_PRO' || msg.text === 'admin') {
+            await sheetsService.upsertUser(MAIN_SHEET_ID, {
+                telegramId: userId.toString(),
+                fullName: msg.from!.first_name,
+                role: 'ADMIN'
             });
-
-            // Clear feedback mode after one submission
-            if (isFeedbackMode) {
-                await redis.del(`user_feedback_mode:${userId}`);
-            }
-
-        } catch (error) {
-            console.error('Error handling multimodal submission:', error);
-            await bot.sendMessage(msg.chat.id, "❌ Faylni tahlil qilishda xatolik yuz berdi. Iltimos qaytadan urinib ko'ring.");
+            await redis.del(`user_state:${userId}`);
+            return bot.sendMessage(msg.chat.id, "Ustoz paneli ochildi!", { reply_markup: teacherKeyboard });
         }
-    }
-
-    private static async showProgress(msg: TelegramBot.Message) {
-        const topStudents = await prisma.user.findMany({
-            where: { role: 'STUDENT' },
-            orderBy: { totalHomeworks: 'desc' },
-            take: 10
-        });
-
-        const activeCount = topStudents.filter((s: any) => s.totalHomeworks > 0).length;
-
-        let text = `📊 **Statistika va Reyting:**\nFaol o'quvchilar: ${activeCount}/${topStudents.length}\n\n`;
-        topStudents.forEach((s: any, i: number) => {
-            const perc = (s.totalHomeworks > 0) ? 100 : 0; // simplistic completion %
-            text += `${i + 1}. ${s.fullName} - ${s.totalHomeworks} ta vazifa (${perc}% bajargan)\n`;
-        });
-
-        await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+        return bot.sendMessage(msg.chat.id, "Xato parol.");
     }
 
     static async handleCallback(query: TelegramBot.CallbackQuery) {
@@ -678,161 +168,52 @@ export class BotController {
 
         if (!chatId || !data) return;
 
-        if (data === 'group_profile') {
-            const user = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
-            if (!user) {
-                return bot.answerCallbackQuery(query.id, { text: "Avval botni shaxsiy xabarda ishga tushiring!", show_alert: true });
-            }
-
-            // Calculate Rank
-            const rank = await (prisma.user as any).count({
-                where: { totalCoins: { gt: (user as any).totalCoins || 0 } }
-            }) + 1;
-
-            const profile = `👤 ${user.fullName}\n🏆 O'rningiz: ${rank}-o'rin\n💰 Coinlar: ${(user as any).totalCoins || 0}\n📚 Vazifalar: ${user.totalHomeworks}`;
-            return bot.answerCallbackQuery(query.id, { text: profile, show_alert: true });
-        }
-
-        if (data === 'group_feedback') {
-            await redis.set(`user_state:${userId}`, 'WAITING_HW_DESC');
-            return bot.sendMessage(chatId, `✍️ @${query.from.username || query.from.first_name}, yaxshi! Endi feedback beriladigan materialni (matn, rasm yoki audio) yuboring.`, {
-                reply_markup: { inline_keyboard: [[{ text: "❌ Bekor qilish", callback_data: "cancel_state" }]] }
-            });
-        }
-
-        if (data === 'group_ai_teacher') {
-            await redis.set(`user_state:${userId}`, 'WAITING_QUESTION');
-            return bot.sendMessage(chatId, `👨‍🏫 @${query.from.username || query.from.first_name}, marhamat! Tushunmagan mavzuingiz yoki savolingizni yozing. Men guruhdagi oxirgi ma'lumotlar asosida javob beraman.`, {
-                reply_markup: { inline_keyboard: [[{ text: "❌ Bekor qilish", callback_data: "cancel_state" }]] }
-            });
-        }
-
         if (data.startsWith('get_fb_')) {
-            const targetUserId = data.replace('get_fb_', '');
-            await bot.answerCallbackQuery(query.id, { text: "AI tahlil qilmoqda..." });
-            await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: query.message!.message_id });
-
-            const pendingText = await redis.get(`pending_fb_text:${targetUserId}`) || '';
-            const pendingMedia = await redis.get(`pending_fb_media:${targetUserId}`) || '';
+            await bot.answerCallbackQuery(query.id, { text: "Tahlil qilinmoqda..." });
+            const pText = await redis.get(`pending_fb_text:${userId}`) || '';
+            const pMedia = await redis.get(`pending_fb_media:${userId}`) || '';
 
             let mediaParts: any[] = [];
-            if (pendingMedia.startsWith('photo:')) {
-                const fileId = pendingMedia.split(':')[1];
-                const fileLink = await bot.getFileLink(fileId);
-                const response = await fetch(fileLink);
-                const buffer = await response.arrayBuffer();
-                mediaParts.push({ data: Buffer.from(buffer).toString('base64'), mimeType: 'image/jpeg' });
+            if (pMedia.startsWith('photo:')) {
+                const fileLink = await bot.getFileLink(pMedia.split(':')[1]);
+                const resp = await fetch(fileLink);
+                mediaParts.push({ data: Buffer.from(await resp.arrayBuffer()).toString('base64'), mimeType: 'image/jpeg' });
             }
 
-            const feedback = await teacherAgent.evaluateHomework(pendingText, "Umumiy ingliz tili amaliyoti", mediaParts);
-
-            await bot.sendMessage(chatId, `👨‍🏫 **Senior Teacher Feedback:**\n\n${feedback.correction}\n\n💡 **Maslahat:** ${feedback.advice}`, {
-                parse_mode: 'Markdown'
-            });
-
-            await redis.del(`pending_fb_text:${targetUserId}`);
-            await redis.del(`pending_fb_media:${targetUserId}`);
+            const feedback = await teacherAgent.evaluateHomework(pText, "General Practice", mediaParts);
+            await bot.sendMessage(chatId, `👨‍🏫 **Feedback:**\n\n${feedback.correction}\n\n💡 **Maslahat:** ${feedback.advice}`, { parse_mode: 'Markdown' });
+            await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: query.message!.message_id });
             return;
         }
 
         if (data === 'no_fb') {
-            await bot.answerCallbackQuery(query.id, { text: "Ok, barakalla!" });
-            return bot.editMessageText("Harakatdan to'xtamang! 🚀", { chat_id: chatId, message_id: query.message!.message_id });
-        }
-
-        if (data === 'cancel_state') {
-            await redis.del(`user_state:${userId}`);
-            return bot.deleteMessage(chatId, query.message!.message_id);
-        }
-
-        await bot.answerCallbackQuery(query.id);
-    }
-
-    private static async handleQuestion(msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        const text = msg.text || '';
-        const userId = msg.from!.id;
-
-        await bot.sendMessage(chatId, "🤔 Savolingizni tahlil qilyapman, biroz kuting...");
-
-        try {
-            // Fetch context from MessageLog
-            const recentLogs = await (prisma as any).messageLog.findMany({
-                where: { chatId: chatId.toString() },
-                take: 10,
-                orderBy: { createdAt: 'desc' }
-            });
-
-            const context = recentLogs.reverse().map((log: any) => `${log.text}`).join('\n');
-            const fullPrompt = `Guruhdagi kontekst:\n${context}\n\nO'quvchi savoli: ${text}`;
-
-            const answer = await teacherAgent.answerQuestion(fullPrompt);
-            await bot.sendMessage(chatId, answer, { reply_to_message_id: msg.message_id });
-            await redis.del(`user_state:${userId}`);
-        } catch (error) {
-            console.error('AI Question error:', error);
-            await bot.sendMessage(chatId, "Kechirasiz, savolingizga javob berishda texnik xatolik yuz berdi.");
+            return bot.editMessageText("O'qishdan to'xtamang! 🚀", { chat_id: chatId, message_id: query.message!.message_id });
         }
     }
 
-    private static async logMessage(msg: TelegramBot.Message) {
-        const userId = msg.from?.id;
-        const chatId = msg.chat.id.toString();
-        if (!userId) return;
-
-        const dbUser = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
-        if (!dbUser) return;
-
-        let mediaType = 'none';
-        if (msg.photo) mediaType = 'photo';
-        else if (msg.voice) mediaType = 'voice';
-        else if (msg.document) mediaType = 'document';
-
-        await (prisma as any).messageLog.create({
-            data: {
-                userId: dbUser.id,
-                chatId,
-                text: msg.text || msg.caption || '',
-                mediaType
-            }
-        });
+    private static isQuestion(text: string): boolean {
+        return text.length > 10 && (text.endsWith('?') || text.toLowerCase().includes('qanday'));
     }
 
     private static async ensureUser(msg: TelegramBot.Message) {
-        const user = msg.from;
-        if (!user) return;
-
-        await prisma.user.upsert({
-            where: { telegramId: BigInt(user.id) },
-            update: { lastActivity: new Date(), username: user.username },
-            create: {
-                telegramId: BigInt(user.id),
-                username: user.username,
-                fullName: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
-                role: 'STUDENT',
-            },
-        });
+        if (!msg.from) return;
+        const existing = await sheetsService.getUser(MAIN_SHEET_ID, msg.from.id.toString());
+        if (!existing) {
+            await sheetsService.upsertUser(MAIN_SHEET_ID, {
+                telegramId: msg.from.id.toString(),
+                fullName: `${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim(),
+                username: msg.from.username,
+                role: 'STUDENT'
+            });
+        }
     }
 
     private static async ensureGroup(msg: TelegramBot.Message) {
         if (msg.chat.type === 'private') return;
-        const chatId = msg.chat.id.toString();
-
-        await prisma.group.upsert({
-            where: { telegramId: chatId },
-            update: { name: msg.chat.title || 'Guruh' },
-            create: {
-                telegramId: chatId,
-                name: msg.chat.title || 'Guruh',
-                description: 'Telegram Group'
-            }
+        await sheetsService.upsertGroup(MAIN_SHEET_ID, {
+            chatId: msg.chat.id.toString(),
+            name: msg.chat.title || 'Guruh',
+            sheetId: MAIN_SHEET_ID
         });
-    }
-
-    private static async getGroupSheetId(chatId: number): Promise<string | null> {
-        const group = await prisma.group.findFirst({
-            where: { telegramId: chatId.toString() }
-        });
-        return group?.googleSheetId || process.env.GOOGLE_SHEETS_ID || null;
     }
 }

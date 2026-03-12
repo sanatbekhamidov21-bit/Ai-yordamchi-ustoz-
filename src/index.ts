@@ -43,7 +43,7 @@ const init = async () => {
         await prisma.$connect();
         console.log('✅ Database connected successfully');
 
-        if (process.env.NODE_ENV !== 'production' && process.env.BASE_WEBHOOK_URL) {
+        if (process.env.NODE_ENV === 'production' && process.env.BASE_WEBHOOK_URL) {
             const url = `${process.env.BASE_WEBHOOK_URL}/bot${process.env.BOT_TOKEN}`;
             await bot.setWebHook(url, { secret_token: process.env.SECRET_TOKEN });
             console.log('Webhook set successfully');

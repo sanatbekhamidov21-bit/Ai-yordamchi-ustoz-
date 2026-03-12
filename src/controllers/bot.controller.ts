@@ -18,10 +18,10 @@ export class BotController {
 
         if (!userId) return;
 
-        // 0. Handle Multimodal Input (Photos, Voice, etc.)
-        if (msg.photo || msg.voice || msg.document) {
+        // 0. Handle Submissions in Private Chat
+        if (msg.chat.type === 'private' && (msg.photo || msg.voice || msg.document || (text && text.length > 20 && !text.startsWith('/')))) {
             await BotController.logMessage(msg);
-            return BotController.handleMultimodalSubmission(msg);
+            return BotController.handlePrivateSubmission(msg);
         }
 
         await BotController.logMessage(msg);
@@ -222,8 +222,9 @@ export class BotController {
             const group = await prisma.group.findFirst({ where: { telegramId: chatId.toString() } });
             if (group) {
                 const activeHwId = await redis.get(`active_hw_id:${group.id}`);
-                if (activeHwId && BotController.isSubmission(text)) {
-                    return BotController.handleSubmission(msg, activeHwId);
+                if (activeHwId && text.length > 20) {
+                    await BotController.logMessage(msg);
+                    return bot.sendMessage(chatId, "✅ Vazifa qabul qilindi! AI tahlilini kuting...");
                 }
             }
         }
@@ -456,48 +457,70 @@ export class BotController {
         });
     }
 
-    private static isSubmission(text: string): boolean {
-        const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 5);
-        return sentences.length >= 3;
-    }
-
-    private static async handleSubmission(msg: TelegramBot.Message, hwId: string) {
+    private static async handlePrivateSubmission(msg: TelegramBot.Message) {
         const userId = msg.from!.id;
+        const chatId = msg.chat.id;
+
         const dbUser = await prisma.user.findUnique({ where: { telegramId: BigInt(userId) } });
         if (!dbUser) return;
 
-        // Check if already submitted
-        const existing = await prisma.submission.findFirst({
-            where: { userId: dbUser.id, hwId }
-        });
-        if (existing) return;
-
-        const hw = await prisma.homework.findUnique({ where: { id: hwId } });
-        if (!hw) return;
-
-        const evaluation = await teacherAgent.evaluateHomework(msg.text!, hw.description);
-
-        await prisma.submission.create({
-            data: {
-                userId: dbUser.id,
-                hwId,
-                text: msg.text!,
-                score: evaluation.score,
-                feedback: `${evaluation.correction}\n\nMaslahat: ${evaluation.advice}`,
-            },
-        });
-
+        // 1. Give Coins & Update Stats
         await prisma.user.update({
             where: { id: dbUser.id },
-            data: { totalHomeworks: { increment: 1 } }
+            data: {
+                totalHomeworks: { increment: 1 },
+                totalCoins: { increment: 5 }
+            }
         });
 
-        await redis.set(`last_hw:${msg.from!.id}`, hwId);
-        await redis.set(`eval_${msg.from!.id}_${hwId}`, `Ball: ${evaluation.score}/100\n\n${evaluation.correction}\n\n💡 ${evaluation.advice}`);
+        // 2. Forward to Group (Vazifalar bo'limi)
+        const groupId = process.env.GROUP_ID;
+        const topicId = process.env.VAZIFALAR_TOPIC_ID; // Forum Topic ID
 
-        await bot.sendMessage(msg.chat.id, `✅ Vazifangiz qabul qilindi (#HW${hw.hwNumber})!\nAgar men yuborgan xatolar va ko'rsatmalar kerak bo'lsa, /ai feedback yoki shunchaki 'feedback' deb yozing.`, {
-            reply_to_message_id: msg.message_id,
+        if (groupId) {
+            const caption = `📥 **Yangi vazifa topshirildi!**\n\n👤 O'quvchi: ${dbUser.fullName}\n🆔 ID: \`${userId}\`\n💰 Mukofot: +5 coin`;
+
+            try {
+                if (msg.photo) {
+                    await bot.sendPhoto(groupId, msg.photo[msg.photo.length - 1].file_id, {
+                        caption, parse_mode: 'Markdown', message_thread_id: topicId ? parseInt(topicId) : undefined
+                    });
+                } else if (msg.voice) {
+                    await bot.sendVoice(groupId, msg.voice.file_id, {
+                        caption, parse_mode: 'Markdown', message_thread_id: topicId ? parseInt(topicId) : undefined
+                    });
+                } else if (msg.text) {
+                    await bot.sendMessage(groupId, `${caption}\n\n📝 Matn:\n${msg.text}`, {
+                        parse_mode: 'Markdown', message_thread_id: topicId ? parseInt(topicId) : undefined
+                    });
+                }
+            } catch (e) {
+                console.error("Guruhga yuborishda xatolik:", e);
+            }
+        }
+
+        // 3. Ask for Feedback
+        // Temporarily store message data for feedback in Redis
+        let mediaData = '';
+        if (msg.photo) mediaData = `photo:${msg.photo[msg.photo.length - 1].file_id}`;
+        else if (msg.voice) mediaData = `voice:${msg.voice.file_id}`;
+
+        await redis.set(`pending_fb_text:${userId}`, msg.text || msg.caption || '');
+        await redis.set(`pending_fb_media:${userId}`, mediaData);
+
+        return bot.sendMessage(chatId, `✅ **Vazifangiz qabul qilindi!**\n\n💰 Sizga **+5 coin** berildi. Jami: ${((dbUser as any).totalCoins || 0) + 5}\n📂 Vazifa guruhga yuborildi.\n\n🤖 Professional AI feedback beraymi?`, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: "✅ Ha, feedback berish", callback_data: `get_fb_${userId}` }],
+                    [{ text: "❌ Shart emas", callback_data: "no_fb" }]
+                ]
+            }
         });
+    }
+
+    private static isSubmission(text: string): boolean {
+        return text.length > 20;
     }
 
     private static isQuestion(text: string): boolean {
@@ -684,6 +707,39 @@ export class BotController {
             });
         }
 
+        if (data.startsWith('get_fb_')) {
+            const targetUserId = data.replace('get_fb_', '');
+            await bot.answerCallbackQuery(query.id, { text: "AI tahlil qilmoqda..." });
+            await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: query.message!.message_id });
+
+            const pendingText = await redis.get(`pending_fb_text:${targetUserId}`) || '';
+            const pendingMedia = await redis.get(`pending_fb_media:${targetUserId}`) || '';
+
+            let mediaParts: any[] = [];
+            if (pendingMedia.startsWith('photo:')) {
+                const fileId = pendingMedia.split(':')[1];
+                const fileLink = await bot.getFileLink(fileId);
+                const response = await fetch(fileLink);
+                const buffer = await response.arrayBuffer();
+                mediaParts.push({ data: Buffer.from(buffer).toString('base64'), mimeType: 'image/jpeg' });
+            }
+
+            const feedback = await teacherAgent.evaluateHomework(pendingText, "Umumiy ingliz tili amaliyoti", mediaParts);
+
+            await bot.sendMessage(chatId, `👨‍🏫 **Senior Teacher Feedback:**\n\n${feedback.correction}\n\n💡 **Maslahat:** ${feedback.advice}`, {
+                parse_mode: 'Markdown'
+            });
+
+            await redis.del(`pending_fb_text:${targetUserId}`);
+            await redis.del(`pending_fb_media:${targetUserId}`);
+            return;
+        }
+
+        if (data === 'no_fb') {
+            await bot.answerCallbackQuery(query.id, { text: "Ok, barakalla!" });
+            return bot.editMessageText("Harakatdan to'xtamang! 🚀", { chat_id: chatId, message_id: query.message!.message_id });
+        }
+
         if (data === 'cancel_state') {
             await redis.del(`user_state:${userId}`);
             return bot.deleteMessage(chatId, query.message!.message_id);
@@ -701,7 +757,7 @@ export class BotController {
 
         try {
             // Fetch context from MessageLog
-            const recentLogs = await prisma.messageLog.findMany({
+            const recentLogs = await (prisma as any).messageLog.findMany({
                 where: { chatId: chatId.toString() },
                 take: 10,
                 orderBy: { createdAt: 'desc' }
